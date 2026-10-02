@@ -4,6 +4,7 @@ import { $sync } from './replicator';
 import config from '../config';
 import { Common } from '../api/common';
 import statistics from '../api/statistics/statistics-api';
+import { OptimizedStatistic } from '../mempool.interfaces';
 
 interface MissingStatistics {
   '24h': Set<number>;
@@ -24,6 +25,11 @@ const steps = {
   '2y': 28800,
   'all': 43200,
 };
+
+const MAX_EMPTINESS = 0.1;
+const MAX_POLLUTION = 0.1;
+const MAX_DEVIATION = 0.1;
+const VSIZES_LENGTH = 39;
 
 /**
  * Syncs missing statistics data from trusted servers
@@ -81,7 +87,7 @@ class StatisticsReplication {
     let success = false;
     let synced = 0;
     const missed = new Set(missingTimes);
-    const syncResult = await $sync(`/api/v1/statistics/${interval}`);
+    const syncResult = await $sync(`/api/v1/statistics/${interval}`, this.performSanityCheck.bind(this));
     if (syncResult && syncResult.data?.length) {
       success = true;
       logger.info(`Fetched /api/v1/statistics/${interval} from ${syncResult.server}`);
@@ -105,6 +111,181 @@ class StatisticsReplication {
     }
 
     return { success, synced, missed: missed.size };
+  }
+
+  /**
+   * Iterates over the list of results from trusted servers and compares each result against the others
+   * to make sure their responses don't vary too much
+   *
+   * @param results a list of responses from different servers
+   * @param servers the list of servers that returned the results
+   * @param path the path of the endpoint gotten, used to get its timespan parameter
+   * @returns the healthiest result
+   */
+  private performSanityCheck(resultsPerServer: Record<string, OptimizedStatistic[]>, path: string) {
+    const servers = Object.keys(resultsPerServer);
+    const results = Object.values(resultsPerServer);
+    if (Object.entries(resultsPerServer).length === 0) {
+      logger.err(`Early returned in the sanity check due to empty dataset`, 'Replication');
+      return {serverPicked: '', sanitizedResult: []};
+    }
+
+    const routes = path.split('/');
+    const interval = routes[routes.length - 1];
+    const step = steps[interval];
+
+    const slottedResults: Map<number, OptimizedStatistic>[] = [];
+    for (const result of results) {
+      const isValidResult = Array.isArray(result) && result.every(stat => 
+        stat && typeof stat === 'object'
+        && Number.isFinite(Number(stat.added))
+        && Number.isFinite(stat.count)
+        && Array.isArray(stat.vsizes)
+        && stat.vsizes.length === VSIZES_LENGTH
+        && stat.vsizes.every(vsize => Number.isFinite(vsize))
+      );
+      slottedResults.push(isValidResult ? this.mapBySlot(result, step) : new Map());
+    }
+
+    logger.info(`Performing sanity check among ${servers.length} servers to pick the best result`, 'Replication');
+
+    const alreadyScanned: Record<string, boolean> = {};
+    const sanityResults: Record<string, boolean> = {};
+    const emptyResult: Record<number, boolean> = {};
+    for (let i = 0; i < results.length; i++) {
+      if (emptyResult[i] || !Array.isArray(results[i]) || results[i].length === 0) {
+        logger.warn(`Empty result detected in ${servers[i]}`);
+        emptyResult[i] = true;
+        continue;
+      }
+      for (let j = 0; j < results.length; j++) {
+        if (i === j) {
+          continue;
+        }
+        const checksKey = i < j ? `${i}-${j}` : `${j}-${i}`;
+        if (alreadyScanned[checksKey]) {
+          continue;
+        }
+        if (emptyResult[j] || !Array.isArray(results[j]) || results[j].length === 0) {
+          logger.warn(`Empty result detected in ${servers[j]}`);
+          emptyResult[j] = true;
+          continue;
+        }
+
+        const slots1 = slottedResults[i];
+        const slots2 = slottedResults[j];
+        const longest = Math.max(slots1.size, slots2.size);
+        const sharedSlotCount = Array.from(slots1.keys()).filter(slot => slots2.has(slot)).length;
+        const percentageEmptiness = (longest - sharedSlotCount) / longest;
+
+        if (percentageEmptiness > MAX_EMPTINESS) {
+          sanityResults[checksKey] = false;
+          alreadyScanned[checksKey] = true;
+          continue;
+        }
+
+        const sharedSlots: [OptimizedStatistic, OptimizedStatistic][] = [];
+        for (const [slot, stat1] of slots1) {
+          const stat2 = slots2.get(slot);
+          if (stat2) {
+            sharedSlots.push([stat1, stat2]);
+          }
+        }
+
+        if (sharedSlots.length === 0) {
+          sanityResults[checksKey] = false;
+          alreadyScanned[checksKey] = true;
+          continue;
+        }
+
+        const pollutionThreshold = Math.floor(sharedSlots.length * MAX_POLLUTION);
+        let pollutionCounter = 0;
+
+        for (const [stat1, stat2] of sharedSlots) {
+          if (pollutionCounter > pollutionThreshold) {
+            logger.warn(`Unhealthy result detected between ${servers[i]} and ${servers[j]}`, 'Replication');
+            break;
+          }
+
+          for (const key of Object.keys(stat1)) {
+            const value1 = stat1[key];
+            const value2 = stat2[key];
+
+            if (key === 'count') {
+              const absDelta = Math.abs(value1 - value2);
+              if (absDelta > Math.max(value1, value2) * MAX_DEVIATION) {
+                pollutionCounter++;
+                break;
+              }
+              continue;
+            }
+
+            if (key === 'vsizes') {
+              if (value1.length !== VSIZES_LENGTH || value2.length !== VSIZES_LENGTH) {
+                pollutionCounter++;
+                break;
+              }
+
+              const sum1 = value1.reduce((acc, val) => acc + val, 0);
+              const sum2 = value2.reduce((acc, val) => acc + val, 0);
+
+              const absDelta = Math.abs(sum1 - sum2);
+              if (absDelta > Math.max(sum1, sum2) * MAX_DEVIATION) {
+                pollutionCounter++;
+                break;
+              }
+              continue;
+            }
+          }
+        }
+
+        sanityResults[checksKey] = pollutionCounter <= pollutionThreshold;
+        alreadyScanned[checksKey] = true;
+      }
+    }
+
+    const candidates: Record<number, number> = {};
+    for (const [key, result] of Object.entries(sanityResults)) {
+      const [i, j] = key.split('-');
+
+      if (result) {
+        if (!candidates[i]) {
+          candidates[i] = 0;
+        }
+        if (!candidates[j]) {
+          candidates[j] = 0;
+        }
+        candidates[i]++;
+        candidates[j]++;
+      }
+    }
+
+    let bestCandidateIndex = -1;
+    for (const index of Object.keys(candidates)) {
+      if (bestCandidateIndex === -1 || candidates[index] > candidates[bestCandidateIndex]) {
+        bestCandidateIndex = Number(index);
+      }
+    }
+
+    if (bestCandidateIndex === -1 || candidates[bestCandidateIndex] < Math.floor(results.length / 2)) {
+      logger.err(`The sanity check didn't reach majority agreement among ${servers.length} servers for ${path}`, 'Replication');
+      return {serverPicked: '', sanitizedResult: []};
+    }
+
+    logger.info(`Best server after performing sanity check: ${servers[bestCandidateIndex]}`, 'Replication');
+
+    return {serverPicked: servers[bestCandidateIndex], sanitizedResult: results[bestCandidateIndex]};
+  }
+
+  private mapBySlot(stats: OptimizedStatistic[], step: number) {
+    const slots = new Map<number, OptimizedStatistic>();
+    for (const stat of stats) {
+      const slot = this.roundToNearestStep(Number(stat.added), step);
+      if (!slots.has(slot)) {
+        slots.set(slot, stat);
+      }
+    }
+    return slots;
   }
 
   
