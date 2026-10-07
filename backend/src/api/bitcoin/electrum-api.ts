@@ -93,7 +93,7 @@ class BitcoindElectrsApi extends BitcoinApi implements AbstractBitcoinApi {
       let startingIndex = 0;
       if (lastSeenTxId) {
         const pos = history.findIndex((historicalTx) => historicalTx.tx_hash === lastSeenTxId);
-        if (pos) {
+        if (pos >= 0) {
           startingIndex = pos + 1;
         }
       }
@@ -174,7 +174,7 @@ class BitcoindElectrsApi extends BitcoinApi implements AbstractBitcoinApi {
       let startingIndex = 0;
       if (lastSeenTxId) {
         const pos = history.findIndex((historicalTx) => historicalTx.tx_hash === lastSeenTxId);
-        if (pos) {
+        if (pos >= 0) {
           startingIndex = pos + 1;
         }
       }
